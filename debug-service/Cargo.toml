@@ -1,0 +1,21 @@
+[package]
+name = "debug-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+critical-section.workspace = true
+defmt.workspace = true
+
+[dev-dependencies]
+defmt-test = "0.3"
+critical-section = { workspace = true, features = ["std"] }
+
+# Test-specific features
+[features]
+test = []
+
+[lints]
+workspace = true
