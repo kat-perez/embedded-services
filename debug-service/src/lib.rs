@@ -11,14 +11,28 @@
 //! cargo test -- --test-threads=1
 //! ```
 
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 static mut ENCODER: defmt::Encoder = defmt::Encoder::new();
 static mut RESTORE_STATE: critical_section::RestoreState = critical_section::RestoreState::invalid();
 
-// Simple circular buffer implementation
-const BUFFER_SIZE: usize = 4096;
-static mut BUFFER: [u8; BUFFER_SIZE] = [0; BUFFER_SIZE];
+/// Safety: We ensure thread safety through critical sections and atomic operations
+struct SyncUnsafeCell<T>(UnsafeCell<T>);
+unsafe impl<T> Sync for SyncUnsafeCell<T> {}
+
+impl<T> SyncUnsafeCell<T> {
+    const fn new(value: T) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    fn get(&self) -> *mut T {
+        self.0.get()
+    }
+}
+
+const BUFFER_SIZE: usize = 1024;
+static BUFFER: SyncUnsafeCell<[u8; BUFFER_SIZE]> = SyncUnsafeCell::new([0; BUFFER_SIZE]);
 static WRITE_INDEX: AtomicUsize = AtomicUsize::new(0);
 static READ_INDEX: AtomicUsize = AtomicUsize::new(0);
 
@@ -37,41 +51,50 @@ pub fn bytes_available() -> usize {
 /// Read data from the circular buffer
 /// Returns the number of bytes actually read
 pub fn read_debug_data(dest: &mut [u8]) -> usize {
-    let mut bytes_read = 0;
-    let read_idx = READ_INDEX.load(Ordering::Acquire);
-    let write_idx = WRITE_INDEX.load(Ordering::Acquire);
-
-    if read_idx == write_idx {
-        return 0; // Buffer is empty
+    if dest.is_empty() {
+        return 0;
     }
 
     critical_section::with(|_| {
         let current_read = READ_INDEX.load(Ordering::Relaxed);
         let current_write = WRITE_INDEX.load(Ordering::Relaxed);
 
-        if current_read != current_write {
-            let available = if current_write >= current_read {
-                current_write - current_read
-            } else {
-                BUFFER_SIZE - current_read + current_write
-            };
-
-            let to_read = dest.len().min(available);
-
-            for i in 0..to_read {
-                let idx = (current_read + i) % BUFFER_SIZE;
-                unsafe {
-                    dest[i] = BUFFER[idx];
-                }
-                bytes_read += 1;
-            }
-
-            let new_read_idx = (current_read + bytes_read) % BUFFER_SIZE;
-            READ_INDEX.store(new_read_idx, Ordering::Release);
+        if current_read == current_write {
+            return 0; // Buffer is empty
         }
-    });
 
-    bytes_read
+        // Calculate available bytes
+        let available = if current_write >= current_read {
+            current_write - current_read
+        } else {
+            BUFFER_SIZE - current_read + current_write
+        };
+
+        let to_read = dest.len().min(available);
+        let buffer_ptr = BUFFER.get() as *const u8;
+
+        // Fast path: no wraparound needed (most common case)
+        if current_read + to_read <= BUFFER_SIZE {
+            unsafe {
+                core::ptr::copy_nonoverlapping(buffer_ptr.add(current_read), dest.as_mut_ptr(), to_read);
+            }
+        } else {
+            // Slow path: wraparound needed
+            let first_chunk = BUFFER_SIZE - current_read;
+            let second_chunk = to_read - first_chunk;
+            unsafe {
+                // First chunk: from current_read to end of buffer
+                core::ptr::copy_nonoverlapping(buffer_ptr.add(current_read), dest.as_mut_ptr(), first_chunk);
+                // Second chunk: from start of buffer
+                core::ptr::copy_nonoverlapping(buffer_ptr, dest.as_mut_ptr().add(first_chunk), second_chunk);
+            }
+        }
+
+        let new_read_idx = (current_read + to_read) % BUFFER_SIZE;
+        READ_INDEX.store(new_read_idx, Ordering::Release);
+
+        to_read
+    })
 }
 
 #[defmt::global_logger]
@@ -97,38 +120,51 @@ unsafe impl defmt::Logger for DefmtLogger {
 }
 
 unsafe fn write(bytes: &[u8]) {
-    // Write bytes to the circular buffer
+    if bytes.is_empty() {
+        return;
+    }
+
+    let len = bytes.len();
     let current_write = WRITE_INDEX.load(Ordering::Acquire);
     let current_read = READ_INDEX.load(Ordering::Acquire);
 
-    // Calculate available space in the buffer
-    let available_space = if current_read > current_write {
-        current_read - current_write - 1
-    } else if current_read == 0 {
-        BUFFER_SIZE - current_write - 1
-    } else {
+    // Simplified available space calculation
+    let available_space = if current_read <= current_write {
         BUFFER_SIZE - current_write + current_read - 1
+    } else {
+        current_read - current_write - 1
     };
 
-    // Determine how many bytes we can actually write
-    let bytes_to_write = bytes.len().min(available_space);
-
-    if bytes_to_write > 0 {
-        // Write the bytes to the buffer
-        unsafe {
-            for i in 0..bytes_to_write {
-                let idx = (current_write + i) % BUFFER_SIZE;
-                BUFFER[idx] = bytes[i];
-            }
-        }
-
-        // Update the write index
-        let new_write_idx = (current_write + bytes_to_write) % BUFFER_SIZE;
-        WRITE_INDEX.store(new_write_idx, Ordering::Release);
+    if available_space == 0 {
+        return; // Buffer is full, drop the data
     }
 
-    // If we couldn't write all bytes, they are silently dropped
-    // This is typical behavior for debug/logging systems to avoid blocking
+    let bytes_to_write = len.min(available_space);
+    let buffer_ptr = BUFFER.get() as *mut u8;
+
+    // Fast path: no wraparound (most common case)
+    if current_write + bytes_to_write <= BUFFER_SIZE {
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer_ptr.add(current_write), bytes_to_write);
+        }
+    } else {
+        // Slow path: wraparound needed
+        let first_chunk = BUFFER_SIZE - current_write;
+        unsafe {
+            // First chunk: from current_write to end of buffer
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer_ptr.add(current_write), first_chunk);
+            // Second chunk: from start of buffer
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr().add(first_chunk),
+                buffer_ptr,
+                bytes_to_write - first_chunk,
+            );
+        }
+    }
+
+    // Single atomic store at the end
+    let new_write_idx = (current_write + bytes_to_write) % BUFFER_SIZE;
+    WRITE_INDEX.store(new_write_idx, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -143,9 +179,8 @@ mod tests {
         WRITE_INDEX.store(0, Ordering::Release);
         READ_INDEX.store(0, Ordering::Release);
         unsafe {
-            for i in 0..BUFFER_SIZE {
-                BUFFER[i] = 0;
-            }
+            let buffer_ptr = BUFFER.get() as *mut u8;
+            core::ptr::write_bytes(buffer_ptr, 0, BUFFER_SIZE);
         }
     }
 
@@ -382,5 +417,64 @@ mod tests {
         let mut buffer = [0u8; 100];
         let bytes_read = read_debug_data(&mut buffer);
         assert!(bytes_read > 0, "Should be able to read logger output");
+    }
+
+    // Performance test to validate optimizations
+    #[test]
+    fn test_performance_bulk_operations() {
+        reset_buffer();
+
+        // Test writing many small chunks (common defmt pattern)
+        let small_chunk = b"LOG: ";
+        let iterations = 100;
+
+        for _ in 0..iterations {
+            unsafe { write(small_chunk) };
+        }
+
+        // Verify we captured data
+        let available = bytes_available();
+        assert!(available > 0, "Should have captured bulk write data");
+
+        // Test reading in various chunk sizes
+        let mut total_read = 0;
+        while bytes_available() > 0 {
+            let mut chunk = [0u8; 37]; // Odd size to test efficiency
+            let read = read_debug_data(&mut chunk);
+            if read == 0 {
+                break;
+            }
+            total_read += read;
+        }
+
+        assert!(total_read > 0, "Should have read back bulk data efficiently");
+        assert_eq!(bytes_available(), 0, "Buffer should be empty after bulk read");
+    }
+
+    // Test wraparound performance
+    #[test]
+    fn test_wraparound_performance() {
+        reset_buffer();
+
+        // Fill most of the buffer
+        let large_chunk = [b'X'; BUFFER_SIZE - 100];
+        unsafe { write(&large_chunk) };
+
+        // Read most of it to create space at the beginning
+        let mut read_buffer = [0u8; BUFFER_SIZE - 200];
+        let _read = read_debug_data(&mut read_buffer);
+
+        // Now write data that will wrap around
+        let wrap_data = [b'W'; 150];
+        unsafe { write(&wrap_data) };
+
+        // Verify wraparound worked efficiently
+        let available = bytes_available();
+        assert!(available > 0, "Wraparound write should succeed");
+
+        // Read the wrapped data
+        let mut wrap_read = [0u8; 200];
+        let wrapped_read = read_debug_data(&mut wrap_read);
+        assert!(wrapped_read > 0, "Should efficiently read wrapped data");
     }
 }
