@@ -7,16 +7,17 @@ repository.workspace = true
 
 [dependencies]
 critical-section.workspace = true
-defmt.workspace = true
+defmt = { workspace = true, optional = true }
 embedded-services = { path = "../embedded-service" }
+heapless = "0.8"
+
+[features]
+defmt = ["dep:defmt"]
+test = []
 
 [dev-dependencies]
 defmt-test = "0.3"
 critical-section = { workspace = true, features = ["std"] }
-
-# Test-specific features
-[features]
-test = []
 
 [lints]
 workspace = true

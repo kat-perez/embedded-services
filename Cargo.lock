@@ -399,6 +399,7 @@ dependencies = [
  "defmt 0.3.100",
  "defmt-test",
  "embedded-services",
+ "heapless 0.8.0",
 ]
 
 [[package]]
