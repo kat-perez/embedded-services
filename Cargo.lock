@@ -398,6 +398,7 @@ dependencies = [
  "critical-section",
  "defmt 0.3.100",
  "defmt-test",
+ "embedded-services",
 ]
 
 [[package]]

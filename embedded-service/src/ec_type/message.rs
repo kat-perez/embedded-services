@@ -86,3 +86,43 @@ pub enum ThermalMessage {
     Tmp1Low(u32),
     Tmp1High(u32),
 }
+
+/// Debug logger message types for eSPI transport
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum DebugLoggerMessage {
+    /// Get log buffer command
+    GetLogBuffer,
+    /// Get logger status command  
+    GetLoggerStatus,
+    /// Response with log buffer data
+    RspLogBuffer {
+        /// Number of bytes available in the buffer
+        available_bytes: u32,
+        /// Buffer data (up to 1024 bytes for current implementation)
+        data: [u8; 1024],
+        /// Actual number of bytes in this response
+        data_length: u32,
+    },
+    /// Response with logger status
+    RspLoggerStatus {
+        /// Buffer capacity in bytes
+        buffer_capacity: u32,
+        /// Current bytes available to read
+        bytes_available: u32,
+        /// Write index position
+        write_index: u32,
+        /// Read index position  
+        read_index: u32,
+        /// Whether notifications are enabled
+        notifications_enabled: bool,
+    },
+    /// Set notification preferences
+    SetNotification {
+        /// Enable/disable notifications when new log data arrives
+        enable: bool,
+        /// Minimum bytes threshold before sending notification
+        threshold: u32,
+    },
+}

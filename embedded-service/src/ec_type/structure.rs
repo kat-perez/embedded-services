@@ -121,6 +121,24 @@ pub struct Notifications {
 #[allow(missing_docs)]
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct DebugLogger {
+    pub events: u32,
+    pub status: u32,
+    pub buffer_capacity: u32,
+    pub bytes_available: u32,
+    pub write_index: u32,
+    pub read_index: u32,
+    pub notifications_enabled: u32,
+    pub notification_threshold: u32,
+    pub command: u32,
+    pub response_status: u32,
+    pub data_length: u32,
+    pub res0: u32,
+}
+
+#[allow(missing_docs)]
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ECMemory {
     pub ver: Version,
     pub caps: Capabilities,
@@ -128,4 +146,5 @@ pub struct ECMemory {
     pub alarm: TimeAlarm,
     pub batt: Battery,
     pub therm: Thermal,
+    pub debug: DebugLogger,
 }

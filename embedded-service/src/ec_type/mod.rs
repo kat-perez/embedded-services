@@ -502,6 +502,119 @@ pub fn mem_map_to_time_alarm_msg(
     }
 }
 
+/// Update debug logger section of memory map based on debug logger message
+pub fn update_debug_logger_section(msg: &message::DebugLoggerMessage, memory_map: &mut structure::ECMemory) {
+    match msg {
+        message::DebugLoggerMessage::GetLogBuffer => {
+            memory_map.debug.command = 1; // GET_LOG_BUFFER command
+        }
+        message::DebugLoggerMessage::GetLoggerStatus => {
+            memory_map.debug.command = 2; // GET_LOGGER_STATUS command
+        }
+        message::DebugLoggerMessage::RspLogBuffer {
+            available_bytes,
+            data_length,
+            ..
+        } => {
+            memory_map.debug.bytes_available = *available_bytes;
+            memory_map.debug.data_length = *data_length;
+            memory_map.debug.response_status = 3; // RSP_LOG_BUFFER response
+        }
+        message::DebugLoggerMessage::RspLoggerStatus {
+            buffer_capacity,
+            bytes_available,
+            write_index,
+            read_index,
+            notifications_enabled,
+        } => {
+            memory_map.debug.buffer_capacity = *buffer_capacity;
+            memory_map.debug.bytes_available = *bytes_available;
+            memory_map.debug.write_index = *write_index;
+            memory_map.debug.read_index = *read_index;
+            memory_map.debug.notifications_enabled = if *notifications_enabled { 1 } else { 0 };
+            memory_map.debug.response_status = 4; // RSP_LOGGER_STATUS response
+        }
+        message::DebugLoggerMessage::SetNotification { enable, threshold } => {
+            memory_map.debug.notifications_enabled = if *enable { 1 } else { 0 };
+            memory_map.debug.notification_threshold = *threshold;
+            memory_map.debug.command = 5; // SET_NOTIFICATION command
+        }
+    }
+}
+
+/// Convert from memory map offset and length to debug logger message
+/// Modifies offset and length
+pub fn mem_map_to_debug_logger_msg(
+    memory_map: &structure::ECMemory,
+    offset: &mut usize,
+    length: &mut usize,
+) -> Result<message::DebugLoggerMessage, Error> {
+    let local_offset = *offset - offset_of!(structure::ECMemory, debug);
+
+    if local_offset == offset_of!(structure::DebugLogger, events) {
+        into_message!(offset, length, memory_map.debug.events, |_| {
+            message::DebugLoggerMessage::GetLoggerStatus
+        });
+    } else if local_offset == offset_of!(structure::DebugLogger, status) {
+        into_message!(offset, length, memory_map.debug.status, |_| {
+            message::DebugLoggerMessage::GetLoggerStatus
+        });
+    } else if local_offset == offset_of!(structure::DebugLogger, buffer_capacity) {
+        into_message!(offset, length, memory_map.debug.buffer_capacity, |_| {
+            message::DebugLoggerMessage::GetLoggerStatus
+        });
+    } else if local_offset == offset_of!(structure::DebugLogger, bytes_available) {
+        into_message!(offset, length, memory_map.debug.bytes_available, |_| {
+            message::DebugLoggerMessage::GetLoggerStatus
+        });
+    } else if local_offset == offset_of!(structure::DebugLogger, write_index) {
+        into_message!(offset, length, memory_map.debug.write_index, |_| {
+            message::DebugLoggerMessage::GetLoggerStatus
+        });
+    } else if local_offset == offset_of!(structure::DebugLogger, read_index) {
+        into_message!(offset, length, memory_map.debug.read_index, |_| {
+            message::DebugLoggerMessage::GetLoggerStatus
+        });
+    } else if local_offset == offset_of!(structure::DebugLogger, notifications_enabled) {
+        into_message!(offset, length, memory_map.debug.notifications_enabled, |_| {
+            message::DebugLoggerMessage::GetLoggerStatus
+        });
+    } else if local_offset == offset_of!(structure::DebugLogger, notification_threshold) {
+        into_message!(offset, length, memory_map.debug.notification_threshold, |_| {
+            message::DebugLoggerMessage::GetLoggerStatus
+        });
+    } else if local_offset == offset_of!(structure::DebugLogger, command) {
+        // Commands from host
+        let cmd = memory_map.debug.command;
+        *offset += core::mem::size_of::<u32>();
+        *length -= core::mem::size_of::<u32>();
+        match cmd {
+            1 => Ok(message::DebugLoggerMessage::GetLogBuffer),
+            2 => Ok(message::DebugLoggerMessage::GetLoggerStatus),
+            5 => {
+                let enable = memory_map.debug.notifications_enabled != 0;
+                let threshold = memory_map.debug.notification_threshold;
+                Ok(message::DebugLoggerMessage::SetNotification { enable, threshold })
+            }
+            _ => Err(Error::InvalidLocation),
+        }
+    } else if local_offset == offset_of!(structure::DebugLogger, response_status) {
+        into_message!(offset, length, memory_map.debug.response_status, |_| {
+            message::DebugLoggerMessage::GetLoggerStatus
+        });
+    } else if local_offset == offset_of!(structure::DebugLogger, data_length) {
+        into_message!(offset, length, memory_map.debug.data_length, |_| {
+            message::DebugLoggerMessage::GetLoggerStatus
+        });
+    } else if local_offset == offset_of!(structure::DebugLogger, res0) {
+        into_message!(offset, length, memory_map.debug.res0, |_| {
+            message::DebugLoggerMessage::GetLoggerStatus
+        });
+    } else {
+        Err(Error::InvalidLocation)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

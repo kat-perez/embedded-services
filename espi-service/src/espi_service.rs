@@ -49,6 +49,11 @@ impl Service<'_> {
                 && offset < offset_of!(ec_type::structure::ECMemory, alarm) + size_of::<ec_type::structure::TimeAlarm>()
             {
                 self.route_to_time_alarm_service(&mut offset, &mut length).await?;
+            } else if offset >= offset_of!(ec_type::structure::ECMemory, debug)
+                && offset
+                    < offset_of!(ec_type::structure::ECMemory, debug) + size_of::<ec_type::structure::DebugLogger>()
+            {
+                self.route_to_debug_service(&mut offset, &mut length).await?;
             }
         }
 
@@ -114,6 +119,26 @@ impl Service<'_> {
 
         Ok(())
     }
+
+    async fn route_to_debug_service(&self, offset: &mut usize, length: &mut usize) -> Result<(), ec_type::Error> {
+        let msg = {
+            let memory_map = self
+                .ec_memory
+                .try_lock()
+                .expect("Messages handled one after another, should be infallible.");
+            ec_type::mem_map_to_debug_logger_msg(&memory_map, offset, length)?
+        };
+
+        comms::send(
+            EndpointID::External(External::Host),
+            EndpointID::Internal(Internal::Debug),
+            &msg,
+        )
+        .await
+        .unwrap();
+
+        Ok(())
+    }
 }
 
 impl comms::MailboxDelegate for Service<'_> {
@@ -130,6 +155,8 @@ impl comms::MailboxDelegate for Service<'_> {
             ec_type::update_thermal_section(msg, &mut memory_map);
         } else if let Some(msg) = message.data.get::<ec_type::message::TimeAlarmMessage>() {
             ec_type::update_time_alarm_section(msg, &mut memory_map);
+        } else if let Some(msg) = message.data.get::<ec_type::message::DebugLoggerMessage>() {
+            ec_type::update_debug_logger_section(msg, &mut memory_map);
         } else {
             return Err(comms::MailboxDelegateError::MessageNotFound);
         }

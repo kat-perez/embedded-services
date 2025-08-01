@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 critical-section.workspace = true
 defmt.workspace = true
+embedded-services = { path = "../embedded-service" }
 
 [dev-dependencies]
 defmt-test = "0.3"

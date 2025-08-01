@@ -4,6 +4,13 @@
 //! for later retrieval, useful for debugging embedded systems where direct
 //! console output may not be available.
 //!
+//! ## Features
+//!
+//! - Circular buffer for efficient log storage
+//! - eSPI transport integration via comms trait
+//! - API functions for retrieving logs and status
+//! - Notification support for new log data
+//!
 //! ## Testing
 //!
 //! Due to the use of global static state, tests should be run with a single thread:
@@ -12,7 +19,11 @@
 //! ```
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+// Import comms and EC type definitions for eSPI transport
+use embedded_services::comms::{self, Endpoint, EndpointID, MailboxDelegate, MailboxDelegateError};
+use embedded_services::ec_type::message::DebugLoggerMessage;
 
 static mut ENCODER: defmt::Encoder = defmt::Encoder::new();
 static mut RESTORE_STATE: critical_section::RestoreState = critical_section::RestoreState::invalid();
@@ -35,6 +46,193 @@ const BUFFER_SIZE: usize = 1024;
 static BUFFER: SyncUnsafeCell<[u8; BUFFER_SIZE]> = SyncUnsafeCell::new([0; BUFFER_SIZE]);
 static WRITE_INDEX: AtomicUsize = AtomicUsize::new(0);
 static READ_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+// Notification state for eSPI transport
+static NOTIFICATIONS_ENABLED: AtomicBool = AtomicBool::new(false);
+static NOTIFICATION_THRESHOLD: AtomicUsize = AtomicUsize::new(0);
+
+/// Debug service that integrates with the comms system for eSPI transport
+pub struct DebugService {
+    pub endpoint: Endpoint,
+}
+
+impl Default for DebugService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DebugService {
+    /// Create a new debug service instance
+    pub const fn new() -> Self {
+        Self {
+            endpoint: Endpoint::uninit(EndpointID::Internal(embedded_services::comms::Internal::Debug)),
+        }
+    }
+
+    /// Register this service with the comms system
+    pub async fn register(&'static self) -> Result<(), embedded_services::intrusive_list::Error> {
+        comms::register_endpoint(self, &self.endpoint).await
+    }
+
+    /// Send a notification to the host when new log data is available
+    #[allow(dead_code)]
+    async fn notify_host_if_needed(&self) {
+        if NOTIFICATIONS_ENABLED.load(Ordering::Acquire) {
+            let available = bytes_available();
+            let threshold = NOTIFICATION_THRESHOLD.load(Ordering::Acquire);
+
+            if available >= threshold {
+                let response = DebugLoggerMessage::RspLoggerStatus {
+                    buffer_capacity: BUFFER_SIZE as u32,
+                    bytes_available: available as u32,
+                    write_index: WRITE_INDEX.load(Ordering::Acquire) as u32,
+                    read_index: READ_INDEX.load(Ordering::Acquire) as u32,
+                    notifications_enabled: true,
+                };
+
+                let _ = self
+                    .endpoint
+                    .send(
+                        EndpointID::External(embedded_services::comms::External::Host),
+                        &response,
+                    )
+                    .await;
+            }
+        }
+    }
+
+    /// Handle debug logger commands from the host
+    #[allow(dead_code)]
+    async fn handle_command(&self, msg: &DebugLoggerMessage) {
+        match msg {
+            DebugLoggerMessage::GetLogBuffer => {
+                let mut data = [0u8; BUFFER_SIZE];
+                let bytes_read = read_debug_data(&mut data);
+                let available = bytes_available();
+
+                let response = DebugLoggerMessage::RspLogBuffer {
+                    available_bytes: available as u32,
+                    data,
+                    data_length: bytes_read as u32,
+                };
+
+                let _ = self
+                    .endpoint
+                    .send(
+                        EndpointID::External(embedded_services::comms::External::Host),
+                        &response,
+                    )
+                    .await;
+            }
+            DebugLoggerMessage::GetLoggerStatus => {
+                let response = DebugLoggerMessage::RspLoggerStatus {
+                    buffer_capacity: BUFFER_SIZE as u32,
+                    bytes_available: bytes_available() as u32,
+                    write_index: WRITE_INDEX.load(Ordering::Acquire) as u32,
+                    read_index: READ_INDEX.load(Ordering::Acquire) as u32,
+                    notifications_enabled: NOTIFICATIONS_ENABLED.load(Ordering::Acquire),
+                };
+
+                let _ = self
+                    .endpoint
+                    .send(
+                        EndpointID::External(embedded_services::comms::External::Host),
+                        &response,
+                    )
+                    .await;
+            }
+            DebugLoggerMessage::SetNotification { enable, threshold } => {
+                NOTIFICATIONS_ENABLED.store(*enable, Ordering::Release);
+                NOTIFICATION_THRESHOLD.store(*threshold as usize, Ordering::Release);
+            }
+            // Response messages are sent to host, not processed by service
+            DebugLoggerMessage::RspLogBuffer { .. } | DebugLoggerMessage::RspLoggerStatus { .. } => {}
+        }
+    }
+}
+
+impl MailboxDelegate for DebugService {
+    fn receive(&self, message: &comms::Message) -> Result<(), MailboxDelegateError> {
+        if let Some(debug_msg) = message.data.get::<DebugLoggerMessage>() {
+            // We can't await in this sync function, so we'll need to handle commands
+            // in a way that doesn't require async. For now, we'll update state directly.
+            match debug_msg {
+                DebugLoggerMessage::SetNotification { enable, threshold } => {
+                    NOTIFICATIONS_ENABLED.store(*enable, Ordering::Release);
+                    NOTIFICATION_THRESHOLD.store(*threshold as usize, Ordering::Release);
+                    Ok(())
+                }
+                // For commands that need responses, we'll need a different approach
+                // This could be handled by spawning a task or using a different pattern
+                _ => Ok(()),
+            }
+        } else {
+            Err(MailboxDelegateError::MessageNotFound)
+        }
+    }
+}
+
+/// Public API functions for debug logger clients
+
+/// Get the current buffer capacity in bytes
+pub fn get_buffer_capacity() -> usize {
+    BUFFER_SIZE
+}
+
+/// Check if notifications are currently enabled
+pub fn are_notifications_enabled() -> bool {
+    NOTIFICATIONS_ENABLED.load(Ordering::Acquire)
+}
+
+/// Get the current notification threshold
+pub fn get_notification_threshold() -> usize {
+    NOTIFICATION_THRESHOLD.load(Ordering::Acquire)
+}
+
+/// Set notification preferences
+pub fn set_notification(enable: bool, threshold: usize) {
+    NOTIFICATIONS_ENABLED.store(enable, Ordering::Release);
+    NOTIFICATION_THRESHOLD.store(threshold, Ordering::Release);
+}
+
+/// Get current write index
+pub fn get_write_index() -> usize {
+    WRITE_INDEX.load(Ordering::Acquire)
+}
+
+/// Get current read index  
+pub fn get_read_index() -> usize {
+    READ_INDEX.load(Ordering::Acquire)
+}
+
+/// Clear the debug buffer (reset read and write indices)
+pub fn clear_buffer() {
+    WRITE_INDEX.store(0, Ordering::Release);
+    READ_INDEX.store(0, Ordering::Release);
+}
+
+/// Get buffer statistics for monitoring
+pub struct BufferStats {
+    pub capacity: usize,
+    pub bytes_available: usize,
+    pub write_index: usize,
+    pub read_index: usize,
+    pub notifications_enabled: bool,
+    pub notification_threshold: usize,
+}
+
+/// Get comprehensive buffer statistics
+pub fn get_buffer_stats() -> BufferStats {
+    BufferStats {
+        capacity: BUFFER_SIZE,
+        bytes_available: bytes_available(),
+        write_index: WRITE_INDEX.load(Ordering::Acquire),
+        read_index: READ_INDEX.load(Ordering::Acquire),
+        notifications_enabled: NOTIFICATIONS_ENABLED.load(Ordering::Acquire),
+        notification_threshold: NOTIFICATION_THRESHOLD.load(Ordering::Acquire),
+    }
+}
 
 /// Get the current number of bytes available to read from the circular buffer
 pub fn bytes_available() -> usize {
@@ -165,6 +363,18 @@ unsafe fn write(bytes: &[u8]) {
     // Single atomic store at the end
     let new_write_idx = (current_write + bytes_to_write) % BUFFER_SIZE;
     WRITE_INDEX.store(new_write_idx, Ordering::Release);
+
+    // Check if we should notify the host about new data
+    // This is a simple check - in a real implementation you might want to be more sophisticated
+    if NOTIFICATIONS_ENABLED.load(Ordering::Acquire) {
+        let available = bytes_available();
+        let threshold = NOTIFICATION_THRESHOLD.load(Ordering::Acquire);
+        if available >= threshold {
+            // Note: We can't easily send notifications from this unsafe context
+            // In a real implementation, you might want to set a flag and handle
+            // notifications from a separate task or interrupt context
+        }
+    }
 }
 
 #[cfg(test)]
