@@ -10,6 +10,9 @@ bbq2 = "0.4.2"
 critical-section.workspace = true
 defmt.workspace = true
 embassy-executor.workspace = true
+embassy-sync.workspace = true
+embedded-services.workspace = true
+heapless = "0.8"
 rtt-target = "0.6.1"
 
 [dev-dependencies]

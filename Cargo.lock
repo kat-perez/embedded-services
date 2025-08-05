@@ -449,6 +449,9 @@ dependencies = [
  "critical-section",
  "defmt 0.3.100",
  "embassy-executor",
+ "embassy-sync",
+ "embedded-services",
+ "heapless 0.8.0",
  "rtt-target",
 ]
 
@@ -864,12 +867,15 @@ version = "0.1.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
+ "debug-service",
  "defmt 0.3.100",
  "embassy-executor",
+ "embassy-futures",
  "embassy-imxrt",
  "embassy-sync",
  "embassy-time",
  "embedded-services",
+ "heapless 0.8.0",
  "log",
 ]
 

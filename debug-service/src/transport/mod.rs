@@ -5,7 +5,7 @@ use core::future::Future;
 /// Transport trait for sending debug data
 pub trait DebugTransport {
     /// Send debug frame data
-    fn send(&mut self, data: &[u8]) -> impl Future<Output = Result<(), TransportError>> + Send;
+    fn send(&mut self, data: &[u8]) -> impl Future<Output = Result<(), TransportError>>;
 }
 
 /// Transport error types
@@ -23,8 +23,9 @@ pub enum TransportError {
 
 pub mod espi;
 pub use espi::EspiTransport;
+pub use espi::get_debug_channel_receiver;
 
 /// Create the default transport
 pub fn create_default_transport() -> impl DebugTransport {
-    return EspiTransport::new();
+    EspiTransport::new()
 }
