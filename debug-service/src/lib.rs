@@ -26,6 +26,7 @@ use bbq2::{
     queue::BBQueue,
     traits::{coordination::cas::AtomicCoord, notifier::maitake::MaiNotSpsc, storage::Inline},
 };
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 
 // Export transport module and types
 pub mod transport;
@@ -56,6 +57,12 @@ static DEFMT_BUFFER: Queue = Queue::new();
 static mut WRITE_GRANT: Option<FramedGrantW<&'static Queue>> = None;
 static mut WRITTEN: usize = 0;
 
+// Signal to notify external services (e.g. eSPI service) that newly encoded
+// defmt data has been committed to the circular buffer and is ready to be
+// consumed. Future work will gate signalling on a configurable threshold; for
+// now we signal on every commit that writes >0 bytes.
+static DATA_AVAILABLE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
 /// Safety:
 /// Only one producer reference may exist at one time
 unsafe fn get_producer() -> &'static mut FramedProducer<&'static Queue> {
@@ -83,12 +90,23 @@ unsafe fn get_write_grant() -> Option<(&'static mut [u8], &'static mut usize)> {
 }
 
 unsafe fn commit_write_grant() {
+    // Capture how many bytes were written before we reset state so we can
+    // decide whether to fire the data-available signal.
+    let written_bytes = unsafe { WRITTEN };
+
     if let Some(wg) = unsafe { &mut *addr_of_mut!(WRITE_GRANT) }.take() {
-        wg.commit(unsafe { WRITTEN } as u16)
+        wg.commit(written_bytes as u16)
     }
 
+    // Reset immediately so further writes start fresh
     unsafe {
         WRITTEN = 0;
+    }
+
+    // Only signal if we actually committed data. This keeps noise down while
+    // still enabling a simple "data ready" wakeup for the consumer side.
+    if written_bytes > 0 {
+        DATA_AVAILABLE_SIGNAL.signal(());
     }
 }
 
@@ -247,4 +265,11 @@ pub async fn defmt_bytes_send_task() {
 /// This allows external code to wait for notifications and pull data when available
 pub fn get_buffer_consumer() -> bbq2::prod_cons::framed::FramedConsumer<&'static Queue> {
     DEFMT_BUFFER.framed_consumer()
+}
+
+/// Get a handle to the data-available signal. The eSPI service (or any other
+/// consumer) can `wait().await` on this to be notified that at least one frame
+/// worth of data has been committed to the internal circular buffer.
+pub fn debug_data_available_signal() -> &'static Signal<CriticalSectionRawMutex, ()> {
+    &DATA_AVAILABLE_SIGNAL
 }

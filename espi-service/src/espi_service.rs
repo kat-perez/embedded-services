@@ -2,7 +2,6 @@ use core::mem::offset_of;
 use core::slice;
 
 use core::borrow::{Borrow, BorrowMut};
-use debug_service::get_debug_channel_receiver;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::once_lock::OnceLock;
 use embassy_sync::signal::Signal;
@@ -184,166 +183,117 @@ pub async fn espi_service(mut espi: espi::Espi<'static>, memory_map_buffer: &'st
     embedded_services::define_static_buffer!(acpi_buf, u8, [0u8; 69]);
 
     let owned_ref = acpi_buf::get_mut().unwrap();
-    let debug_receiver = get_debug_channel_receiver();
 
     loop {
-        // Use select to wait for either eSPI events or debug messages
-        let result = embassy_futures::select::select(
-            // Wait for eSPI hardware events
-            espi.wait_for_event(),
-            // Wait for debug messages that need OOB transmission
-            debug_receiver.receive(),
-        )
-        .await;
+        let event = espi.wait_for_event().await;
+        match event {
+            Ok(espi::Event::PeripheralEvent(port_event)) => {
+                info!(
+                    "eSPI PeripheralEvent Port: {}, direction: {}, address: {}, offset: {}, length: {}",
+                    port_event.port, port_event.direction, port_event.offset, port_event.base_addr, port_event.length,
+                );
 
-        match result {
-            embassy_futures::select::Either::First(event) => {
-                // Handle eSPI hardware events
-                match event {
-                    Ok(espi::Event::PeripheralEvent(port_event)) => {
-                        info!(
-                            "eSPI PeripheralEvent Port: {}, direction: {}, address: {}, offset: {}, length: {}",
-                            port_event.port, port_event.direction, port_event.offset, port_event.base_addr, port_event.length,
+                // If it is a peripheral channel write, then we need to notify the service
+                if port_event.direction {
+                    let res = espi_service
+                        .route_to_service(port_event.offset, port_event.length)
+                        .await;
+
+                    if res.is_err() {
+                        error!(
+                            "eSPI master send invalid offset: {} length: {}",
+                            port_event.offset, port_event.length
                         );
-
-                        // If it is a peripheral channel write, then we need to notify the service
-                        if port_event.direction {
-                            let res = espi_service
-                                .route_to_service(port_event.offset, port_event.length)
-                                .await;
-
-                            if res.is_err() {
-                                error!(
-                                    "eSPI master send invalid offset: {} length: {}",
-                                    port_event.offset, port_event.length
-                                );
-                            }
-                        }
-
-                        espi.complete_port(port_event.port).await;
-                    }
-                    Ok(espi::Event::OOBEvent(port_event)) => {
-                        info!(
-                            "eSPI OOBEvent Port: {}, direction: {}, address: {}, offset: {}, length: {}",
-                            port_event.port, port_event.direction, port_event.offset, port_event.base_addr, port_event.length,
-                        );
-
-                        if port_event.direction {
-                            let src_slice =
-                                unsafe { slice::from_raw_parts(port_event.base_addr as *const u8, port_event.length) };
-
-                            #[cfg(feature = "defmt")]
-                            info!("OOB message: {:02X}", &src_slice[0..]);
-
-                            let acpi_msg: AcpiMsgComms;
-
-                            {
-                                let mut access = owned_ref.borrow_mut();
-                                match handle_mctp_header(src_slice, access.borrow_mut()) {
-                                    Ok((endpoint, payload_len)) => {
-                                        acpi_msg = AcpiMsgComms {
-                                            payload: acpi_buf::get(),
-                                            payload_len,
-                                            endpoint,
-                                        };
-                                    }
-                                    Err(e) => {
-                                        // Packet malformed, throw it away
-                                        error!("MCTP packet malformed: {:?}", e);
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            espi_service.endpoint.send(acpi_msg.endpoint, &acpi_msg).await.unwrap();
-                            info!("MCTP packet forwarded to service: {:?}", acpi_msg.endpoint);
-
-                            let acpi_response = espi_service.comms_signal.wait().await;
-
-                            let response_len = acpi_response.payload_len;
-                            let endpoint = acpi_response.endpoint;
-                            if let Ok((final_packet, final_packet_size)) =
-                                build_mctp_header(acpi_response.payload.borrow().borrow(), response_len, endpoint)
-                            {
-                                info!("Sending MCTP response: {:?}", &final_packet[..final_packet_size]);
-
-                                let result = unsafe { espi.oob_get_write_buffer(port_event.port) };
-
-                                match result {
-                                    Ok(dest_slice) => {
-                                        dest_slice[..final_packet_size].copy_from_slice(&final_packet[..final_packet_size]);
-                                    }
-                                    Err(_e) => {
-                                        #[cfg(feature = "defmt")]
-                                        error!("Failed to retrieve OOB write buffer: {}", _e);
-                                        espi.complete_port(port_event.port).await;
-                                        continue;
-                                    }
-                                }
-
-                                // Don't complete event until we read out OOB data
-                                espi.complete_port(port_event.port).await;
-
-                                // Test code send same data on loopback
-                                let res = espi.oob_write_data(port_event.port, final_packet_size as u8);
-
-                                if res.is_err() {
-                                    #[cfg(feature = "defmt")]
-                                    error!("eSPI OOB write failed: {}", res.err().unwrap());
-                                }
-                            } else {
-                                #[cfg(feature = "defmt")]
-                                error!("Error building MCTP response packet from service {:?}", endpoint);
-                            }
-                        } else {
-                            espi.complete_port(port_event.port).await;
-                        }
-                    }
-                    Ok(espi::Event::Port80) => {
-                        info!("eSPI Port 80");
-                    }
-                    Ok(espi::Event::WireChange(_)) => {
-                        info!("eSPI WireChange");
-                    }
-                    Err(_) => {
-                        error!("eSPI Failed");
                     }
                 }
+
+                espi.complete_port(port_event.port).await;
             }
-            embassy_futures::select::Either::Second(debug_msg) => {
-                // Handle debug message for OOB transmission
+            Ok(espi::Event::OOBEvent(port_event)) => {
                 info!(
-                    "Received debug message for OOB transmission: {} bytes",
-                    debug_msg.data.len()
+                    "eSPI OOBEvent Port: {}, direction: {}, address: {}, offset: {}, length: {}",
+                    port_event.port, port_event.direction, port_event.offset, port_event.base_addr, port_event.length,
                 );
-                
-                // Wrap debug message in MCTP header, using the debug endpoint
-                let debug_endpoint = EndpointID::Internal(Internal::Debug);
-                if let Ok((mctp_packet, mctp_packet_size)) =
-                    build_mctp_header(&debug_msg.data, debug_msg.data.len(), debug_endpoint)
-                {
-                    info!("Sending MCTP-wrapped debug message: {} bytes", mctp_packet_size);
-                    let result = unsafe { espi.oob_get_write_buffer(debug_msg.port as usize) };
-                    match result {
-                        Ok(write_buffer) => {
-                            let data_len = mctp_packet_size.min(write_buffer.len());
-                            write_buffer[..data_len].copy_from_slice(&mctp_packet[..data_len]);
-                            let res = espi.oob_write_data(debug_msg.port as usize, data_len as u8);
-                            if res.is_ok() {
-                                info!("OOB debug transmission started successfully");
-                            } else {
-                                #[cfg(feature = "defmt")]
-                                error!("Failed to start OOB transmission: {}", res.err().unwrap());
+
+                if port_event.direction {
+                    let src_slice =
+                        unsafe { slice::from_raw_parts(port_event.base_addr as *const u8, port_event.length) };
+
+                    #[cfg(feature = "defmt")]
+                    info!("OOB message: {:02X}", &src_slice[0..]);
+
+                    let acpi_msg: AcpiMsgComms;
+
+                    {
+                        let mut access = owned_ref.borrow_mut();
+                        match handle_mctp_header(src_slice, access.borrow_mut()) {
+                            Ok((endpoint, payload_len)) => {
+                                acpi_msg = AcpiMsgComms {
+                                    payload: acpi_buf::get(),
+                                    payload_len,
+                                    endpoint,
+                                };
+                            }
+                            Err(e) => {
+                                // Packet malformed, throw it away
+                                error!("MCTP packet malformed: {:?}", e);
+                                continue;
                             }
                         }
-                        Err(_e) => {
-                            #[cfg(feature = "defmt")]
-                            error!("Failed to get OOB write buffer for debug: {}", _e);
+                    }
+
+                    espi_service.endpoint.send(acpi_msg.endpoint, &acpi_msg).await.unwrap();
+                    info!("MCTP packet forwarded to service: {:?}", acpi_msg.endpoint);
+
+                    let acpi_response = espi_service.comms_signal.wait().await;
+
+                    let response_len = acpi_response.payload_len;
+                    let endpoint = acpi_response.endpoint;
+                    if let Ok((final_packet, final_packet_size)) =
+                        build_mctp_header(acpi_response.payload.borrow().borrow(), response_len, endpoint)
+                    {
+                        info!("Sending MCTP response: {:?}", &final_packet[..final_packet_size]);
+
+                        let result = unsafe { espi.oob_get_write_buffer(port_event.port) };
+
+                        match result {
+                            Ok(dest_slice) => {
+                                dest_slice[..final_packet_size].copy_from_slice(&final_packet[..final_packet_size]);
+                            }
+                            Err(_e) => {
+                                #[cfg(feature = "defmt")]
+                                error!("Failed to retrieve OOB write buffer: {}", _e);
+                                espi.complete_port(port_event.port).await;
+                                continue;
+                            }
                         }
+
+                        // Don't complete event until we read out OOB data
+                        espi.complete_port(port_event.port).await;
+
+                        // Test code send same data on loopback
+                        let res = espi.oob_write_data(port_event.port, final_packet_size as u8);
+
+                        if res.is_err() {
+                            #[cfg(feature = "defmt")]
+                            error!("eSPI OOB write failed: {}", res.err().unwrap());
+                        }
+                    } else {
+                        #[cfg(feature = "defmt")]
+                        error!("Error building MCTP response packet from service {:?}", endpoint);
                     }
                 } else {
-                    error!("Error building MCTP header for debug message");
+                    espi.complete_port(port_event.port).await;
                 }
+            }
+            Ok(espi::Event::Port80) => {
+                info!("eSPI Port 80");
+            }
+            Ok(espi::Event::WireChange(_)) => {
+                info!("eSPI WireChange");
+            }
+            Err(_) => {
+                error!("eSPI Failed");
             }
         }
     }
