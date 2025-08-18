@@ -17,8 +17,6 @@ pub mod transport;
 pub use transport::get_debug_channel_receiver;
 pub use transport::{DebugTransport, TransportError};
 
-// Mock eSPI service module (a local consumer of the eSPI channel for development/testing)
-pub mod mock_espi_service;
 // Re-export internals from the circular buffer module for external users
 mod defmt_ring_logger;
 pub use defmt_ring_logger::{Queue, debug_data_available_signal, defmt_bytes_send_task_impl, get_buffer_consumer};
