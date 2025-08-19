@@ -19,7 +19,7 @@ pub use transport::{DebugTransport, TransportError};
 
 // Re-export internals from the circular buffer module for external users
 mod defmt_ring_logger;
-pub use defmt_ring_logger::{Queue, debug_data_available_signal, defmt_bytes_send_task_impl, get_buffer_consumer};
+pub use defmt_ring_logger::{Queue, defmt_bytes_send_task_impl};
 
 #[derive(Clone)]
 pub struct DebugMsgComms<'a> {
@@ -64,12 +64,10 @@ impl Service {
 
         defmt::debug!("Debug service: GET_DATA_BUFFER received; draining defmt buffer");
 
-        use crate::get_buffer_consumer;
         use crate::transport::espi::MAX_DEBUG_FRAME_SIZE;
         use crate::transport::espi::{EspiDebugMessage, get_debug_channel_sender};
 
         let sender = get_debug_channel_sender();
-        let consumer = get_buffer_consumer();
 
         let mut drained_frames: u32 = 0;
         let mut drained_bytes: usize = 0;
@@ -158,50 +156,4 @@ pub enum DebugTxMessage {
 pub enum DebugRxMessage {
     /// Ask the debug service to flush any available defmt bytes to the mock eSPI service.
     GetDataBuffer,
-}
-
-#[embassy_executor::task]
-pub async fn debug_service_data_ready_task() {
-    info!("Starting mock data ready task");
-    static SERVICE: OnceLock<Service> = OnceLock::new();
-    let debug_service = SERVICE.get_or_init(Service::default);
-
-    loop {
-        info!("Debug service data ready");
-        debug_service
-            .endpoint
-            .send(
-                EndpointID::External(embedded_services::comms::External::Host),
-                &DebugTxMessage::DataReady,
-            )
-            .await
-            .unwrap();
-        embassy_time::Timer::after_secs(1).await;
-    }
-}
-
-// Task: forward a simple DATA_READY marker to the mock eSPI service anytime new
-// defmt bytes are committed to the ring buffer.
-#[embassy_executor::task]
-pub async fn send_data_ready_to_mock_espi() {
-    use crate::transport::espi::MAX_DEBUG_FRAME_SIZE;
-    use crate::transport::espi::{EspiDebugMessage, get_debug_channel_sender};
-
-    defmt::debug!("Starting DATA_READY forwarder to mock eSPI service");
-    let sender = get_debug_channel_sender();
-
-    loop {
-        // Wait until defmt bytes are committed by the logger
-        debug_data_available_signal().wait().await;
-
-        // Build a small payload and try to send without blocking
-        let mut payload: heapless::Vec<u8, { MAX_DEBUG_FRAME_SIZE }> = heapless::Vec::new();
-        let _ = payload.extend_from_slice(b"DATA_READY");
-        let msg = EspiDebugMessage { data: payload, port: 0 };
-
-        match sender.try_send(msg) {
-            Ok(()) => defmt::debug!("Queued DATA_READY to mock eSPI"),
-            Err(_) => defmt::warn!("Mock eSPI channel full; dropping DATA_READY"),
-        }
-    }
 }
