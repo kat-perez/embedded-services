@@ -1,10 +1,10 @@
+use embedded_usb_pd::PdError;
 use embedded_usb_pd::ucsi::cci::Cci;
 use embedded_usb_pd::ucsi::ppm::set_notification_enable::NotificationEnable;
 use embedded_usb_pd::ucsi::ppm::state_machine::{
     Input as PpmInput, Output as PpmOutput, State as PpmState, StateMachine,
 };
-use embedded_usb_pd::ucsi::{ppm, Command, GlobalCommand, GlobalResponse, ResponseData};
-use embedded_usb_pd::PdError;
+use embedded_usb_pd::ucsi::{Command, GlobalCommand, GlobalResponse, ResponseData, ppm};
 
 use super::*;
 
@@ -170,6 +170,7 @@ impl<'a> Service<'a> {
                 error!("PPM state machine transition failed: {:#?}", e);
                 PdError::Failed
             })? {
+                #[allow(unreachable_patterns)]
                 match output {
                     PpmOutput::OpmNotifyCommandComplete => {
                         notify_opm = state.notifications_enabled.cmd_complete();
@@ -187,6 +188,10 @@ impl<'a> Service<'a> {
                         notify_opm = state.notifications_enabled.connect_change();
                         // TODO: use real port
                         response.cci.set_connector_change(GlobalPortId(0));
+                    }
+                    // Fallback for any additional Output variants added upstream
+                    _ => {
+                        // no-op
                     }
                 }
             }
