@@ -138,6 +138,7 @@ pub fn build_mctp_header(
     match src_endpoint {
         crate::comms::EndpointID::Internal(crate::comms::Internal::Battery) => ret[6] = 2,
         crate::comms::EndpointID::Internal(crate::comms::Internal::Thermal) => ret[6] = 3,
+        crate::comms::EndpointID::Internal(crate::comms::Internal::Debug) => ret[6] = 4,
         _ => return Err(MctpError::InvalidDestinationEndpoint),
     }
 
